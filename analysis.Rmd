@@ -1,30 +1,171 @@
 ---
-title: "analysis"
-author: "Zichen Fan"
+title: "P8106 Data Science II – Midterm Project"
+author: "Zichen Fan, Yiming Cao"
 date: "2026-03-29"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r packages}
+library(tidyverse)
+library(caret)
+library(glmnet)        
+library(earth)         # MARS
+library(gbm)           # Gradient Boosting
+library(randomForest)  # Random Forest 
+library(corrplot)
+library(ggpubr)
+library(knitr)
+library(kableExtra)
 ```
 
-## Including Plots
+---
 
-You can also embed plots, for example:
+# Part I — Building a Prediction Model for Researcher A (1990–1995 Cohort)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+## Data Loading and Preprocessing
+
+```{r load-data}
+load("data/datA.RData")
+load("data/datB.RData")
+
+dat_a <- datA
+dat_b <- datB
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Numerically coded categorical variables are converted to factors.
+The patient ID column is excluded from modeling.
+
+```{r factor-coding}
+factor_vars <- c("menopause", "race", "tumor_grade",
+                 "ER", "PR", "HER2", "stage",
+                 "surgery", "chemo", "hormonal_therapy")
+
+recode_factors <- function(df) {
+  df |> mutate(across(all_of(factor_vars), as.factor))
+}
+
+dat_a <- recode_factors(dat_a)
+dat_b <- recode_factors(dat_b)
+
+# Predictor matrices and outcome vectors
+x_a <- dat_a |> select(-id, -log_PFS)
+y_a <- dat_a$log_PFS
+x_b <- dat_b |> select(-id, -log_PFS)
+y_b <- dat_b$log_PFS
+
+cat("datA: n =", nrow(dat_a), " | predictors =", ncol(x_a), "\n")
+cat("datB: n =", nrow(dat_b), " | predictors =", ncol(x_b), "\n")
+```
+
+## Missing Data
+
+```{r missing-data}
+missing_tbl <- dat_a |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") |>
+  filter(n_missing > 0)
+
+if (nrow(missing_tbl) == 0) {
+  cat("No missing values detected in datA.\n")
+} else {
+  kable(missing_tbl, caption = "Missing values in datA") |>
+    kable_styling(full_width = FALSE)
+}
+```
+
+## Exploratory Data Analysis
+
+### Outcome: log(PFS)
+
+```{r eda-outcome, fig.cap="Distribution and normality check of log(PFS) in datA"}
+p_hist <- ggplot(dat_a, aes(x = log_PFS)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white", alpha = 0.85) +
+  labs(title = "Histogram of log(PFS)",
+       x = "log(PFS) in months", y = "Count") +
+  theme_bw()
+
+p_qq <- ggplot(dat_a, aes(sample = log_PFS)) +
+  stat_qq(color = "steelblue", alpha = 0.5) +
+  stat_qq_line(color = "firebrick") +
+  labs(title = "Normal Q-Q Plot") +
+  theme_bw()
+
+ggarrange(p_hist, p_qq, ncol = 2)|>ggsave(filename ="figures/eda_1_outcome_dist.png", width = 12, height = 8, dpi = 300)
+ggarrange(p_hist, p_qq, ncol = 2)
+```
+
+### Continuous Predictors
+
+```{r eda-continuous, fig.height=7, fig.cap="Continuous predictors vs. log(PFS) with loess smoother"}
+cont_vars <- c("age", "bmi", "tumor_size", "lymph_nodes", "Ki67")
+
+dat_a |>
+  select(all_of(cont_vars), log_PFS) |>
+  pivot_longer(-log_PFS, names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value, y = log_PFS)) +
+  geom_point(alpha = 0.25, size = 0.7, color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE,
+              color = "firebrick", linewidth = 0.8) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 3) +
+  labs(title = "Continuous Predictors vs. log(PFS)",
+       x = "Predictor value", y = "log(PFS)") +
+  theme_bw()
+
+ggsave("figures/eda_continuous_loess.png", width = 12, height = 8, dpi = 300)
+```
+
+### Categorical Predictors
+
+```{r eda-categorical, fig.height=9, fig.cap="log(PFS) distribution by categorical predictors"}
+cat_vars <- c("menopause", "race", "tumor_grade",
+              "ER", "PR", "HER2", "stage",
+              "surgery", "chemo", "hormonal_therapy")
+
+dat_a |>
+  select(all_of(cat_vars), log_PFS) |>
+  pivot_longer(-log_PFS, names_to = "variable", values_to = "level") |>
+  ggplot(aes(x = level, y = log_PFS, fill = level)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 4) +
+  labs(title = "log(PFS) by Categorical Predictors",
+       x = NULL, y = "log(PFS)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 7))
+ggsave("figures/eda_categorical_boxplot.png", width = 12, height = 9, dpi = 300)
+```
+
+### Correlation Among Continuous Predictors
+
+```{r eda-correlation, fig.height=5, fig.cap="Pearson correlation matrix for continuous predictors"}
+
+png("figures/eda_correlation_matrix.png", width = 1000, height = 1000, res = 150)
+
+dat_a |>
+  select(all_of(cont_vars), log_PFS) |>
+  cor(use = "complete.obs") |>
+  corrplot(method = "color", type = "upper", tl.cex = 0.85,
+           addCoef.col = "black", number.cex = 0.7,
+           mar = c(0, 0, 1.5, 0),
+           title = "Pearson Correlation – Continuous Variables & Outcome")
+dev.off()
+
+dat_a |>
+  select(all_of(cont_vars), log_PFS) |>
+  cor(use = "complete.obs") |>
+  corrplot(method = "color", type = "upper", tl.cex = 0.85,
+           addCoef.col = "black", number.cex = 0.7,
+           mar = c(0, 0, 1.5, 0),
+           title = "Pearson Correlation – Continuous Variables & Outcome")
+```
