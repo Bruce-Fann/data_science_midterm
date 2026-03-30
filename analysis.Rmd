@@ -1,6 +1,6 @@
 ---
 title: "P8106 Data Science II – Midterm Project"
-author: "Zichen Fan, Yiming Cao"
+author: "Group 33: Zichen Fan, Yiming Cao"
 date: "2026-03-29"
 output: html_document
 ---
@@ -14,19 +14,19 @@ knitr::opts_chunk$set(
   fig.width = 8,
   fig.height = 5
 )
+set.seed(2026)
 ```
 
 ```{r packages}
 library(tidyverse)
 library(caret)
-library(glmnet)        
-library(earth)         # MARS
-library(gbm)           # Gradient Boosting
-library(randomForest)  # Random Forest 
+library(glmnet)
 library(corrplot)
 library(ggpubr)
 library(knitr)
 library(kableExtra)
+library(car)
+library(lmtest)
 ```
 
 ---
@@ -43,22 +43,32 @@ dat_a <- datA
 dat_b <- datB
 ```
 
-Numerically coded categorical variables are converted to factors.
-The patient ID column is excluded from modeling.
+Numerically coded categorical variables are converted to factors with descriptive labels.
 
 ```{r factor-coding}
-factor_vars <- c("menopause", "race", "tumor_grade",
-                 "ER", "PR", "HER2", "stage",
-                 "surgery", "chemo", "hormonal_therapy")
-
 recode_factors <- function(df) {
-  df |> mutate(across(all_of(factor_vars), as.factor))
+  df |> mutate(
+    menopause = factor(menopause, levels = 0:1,
+                       labels = c("Pre", "Post")),
+    race = factor(race, levels = 1:4,
+                  labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade = factor(tumor_grade, levels = 1:3,
+                         labels = c("Well", "Moderate", "Poor")),
+    ER = factor(ER, levels = 0:1, labels = c("Neg", "Pos")),
+    PR = factor(PR, levels = 0:1, labels = c("Neg", "Pos")),
+    HER2 = factor(HER2, levels = 0:1, labels = c("Neg", "Pos")),
+    stage = factor(stage, levels = 1:3, labels = c("I", "II", "III")),
+    surgery = factor(surgery, levels = 0:1,
+                     labels = c("BCS", "Mastectomy")),
+    chemo = factor(chemo, levels = 0:1, labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = 0:1,
+                              labels = c("No", "Yes"))
+  )
 }
 
 dat_a <- recode_factors(dat_a)
 dat_b <- recode_factors(dat_b)
 
-# Predictor matrices and outcome vectors
 x_a <- dat_a |> select(-id, -log_PFS)
 y_a <- dat_a$log_PFS
 x_b <- dat_b |> select(-id, -log_PFS)
@@ -101,8 +111,8 @@ p_qq <- ggplot(dat_a, aes(sample = log_PFS)) +
   labs(title = "Normal Q-Q Plot") +
   theme_bw()
 
-ggarrange(p_hist, p_qq, ncol = 2)|>ggsave(filename ="figures/eda_1_outcome_dist.png", width = 12, height = 8, dpi = 300)
 ggarrange(p_hist, p_qq, ncol = 2)
+ggsave("figures/eda_1_outcome_dist.png", width = 12, height = 5, dpi = 300)
 ```
 
 ### Continuous Predictors
@@ -121,7 +131,6 @@ dat_a |>
   labs(title = "Continuous Predictors vs. log(PFS)",
        x = "Predictor value", y = "log(PFS)") +
   theme_bw()
-
 ggsave("figures/eda_continuous_loess.png", width = 12, height = 8, dpi = 300)
 ```
 
@@ -146,26 +155,388 @@ dat_a |>
 ggsave("figures/eda_categorical_boxplot.png", width = 12, height = 9, dpi = 300)
 ```
 
-### Correlation Among Continuous Predictors
+### Correlation Matrix
 
-```{r eda-correlation, fig.height=5, fig.cap="Pearson correlation matrix for continuous predictors"}
+```{r eda-correlation, fig.width=8, fig.height=8, fig.cap="Correlation matrix of all variables"}
+numeric_for_cor <- datA |> select(-id)
+cor_mat <- cor(numeric_for_cor)
 
+corrplot(cor_mat, method = "color", type = "lower",
+         tl.cex = 0.75, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.55,
+         diag = FALSE,
+         title = "Pearson Correlation – All Variables")
+```
+
+```{r save-corr, include=FALSE}
 png("figures/eda_correlation_matrix.png", width = 1000, height = 1000, res = 150)
-
-dat_a |>
-  select(all_of(cont_vars), log_PFS) |>
-  cor(use = "complete.obs") |>
-  corrplot(method = "color", type = "upper", tl.cex = 0.85,
-           addCoef.col = "black", number.cex = 0.7,
-           mar = c(0, 0, 1.5, 0),
-           title = "Pearson Correlation – Continuous Variables & Outcome")
+corrplot(cor_mat, method = "color", type = "lower",
+         tl.cex = 0.75, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.55,
+         diag = FALSE,
+         title = "Pearson Correlation – All Variables")
 dev.off()
+```
 
-dat_a |>
-  select(all_of(cont_vars), log_PFS) |>
-  cor(use = "complete.obs") |>
-  corrplot(method = "color", type = "upper", tl.cex = 0.85,
-           addCoef.col = "black", number.cex = 0.7,
-           mar = c(0, 0, 1.5, 0),
-           title = "Pearson Correlation – Continuous Variables & Outcome")
+### EDA Summary
+
+The correlation matrix reveals notable multicollinearity: ER and PR are highly correlated (r = 0.74), ER and hormonal therapy are correlated (r = 0.65), and stage shares substantial overlap with tumor size and lymph node count since staging criteria incorporate these variables. Several predictors show negligible association with log(PFS), including BMI, menopause status, and race. The loess curves for continuous predictors suggest roughly linear relationships with log(PFS).
+
+These findings motivate the use of elastic net regression, which simultaneously performs variable selection and handles correlated predictors through its combined L1/L2 penalty. This is preferable to ordinary least squares here because OLS coefficient estimates can become unstable and inflated when predictors are correlated.
+
+## Model Training
+
+We use elastic net with `caret` to tune both the mixing parameter alpha (0 = ridge, 1 = lasso) and the regularization strength lambda via 10-fold cross-validation.
+
+```{r model-data}
+dat_a_model <- dat_a |> select(-id)
+dat_b_model <- dat_b |> select(-id)
+
+x_mat <- model.matrix(log_PFS ~ ., data = dat_a_model)[, -1]
+y_vec <- dat_a_model$log_PFS
+```
+
+```{r enet-tuning}
+ctrl <- trainControl(method = "cv", number = 10)
+
+enet_grid <- expand.grid(
+  alpha = seq(0, 1, by = 0.1),
+  lambda = 10^seq(-4, 0, length.out = 50)
+)
+
+enet_fit <- train(x_mat, y_vec,
+                  method = "glmnet",
+                  trControl = ctrl,
+                  tuneGrid = enet_grid)
+
+enet_fit$bestTune
+plot(enet_fit, main = "Elastic Net: CV RMSE across alpha and lambda")
+```
+
+Fine-tune around the best alpha from the initial search.
+
+```{r enet-finetune}
+fine_grid <- expand.grid(
+  alpha = seq(max(0, enet_fit$bestTune$alpha - 0.1),
+              min(1, enet_fit$bestTune$alpha + 0.1), by = 0.02),
+  lambda = 10^seq(log10(enet_fit$bestTune$lambda) - 1,
+                  log10(enet_fit$bestTune$lambda) + 1, length.out = 50)
+)
+
+enet_fine <- train(x_mat, y_vec,
+                   method = "glmnet",
+                   trControl = ctrl,
+                   tuneGrid = fine_grid)
+
+best_alpha <- enet_fine$bestTune$alpha
+best_lambda <- enet_fine$bestTune$lambda
+cat("Best alpha:", best_alpha, "\n")
+cat("Best lambda:", best_lambda, "\n")
+cat("CV RMSE:", min(enet_fine$results$RMSE, na.rm = TRUE), "\n")
+cat("CV R-squared:", max(enet_fine$results$Rsquared, na.rm = TRUE), "\n")
+```
+
+## Variable Selection and OLS Refit
+
+Extract the variables selected by elastic net (nonzero coefficients), then refit with OLS to obtain standard errors, p-values, and confidence intervals.
+
+```{r enet-coefs}
+enet_coefs <- coef(enet_fine$finalModel, s = best_lambda)
+enet_coefs
+
+selected <- rownames(enet_coefs)[which(enet_coefs != 0)][-1]
+cat("Selected features:\n")
+print(selected)
+```
+
+```{r ols-refit}
+all_predictors <- names(dat_a_model)[names(dat_a_model) != "log_PFS"]
+refit_vars <- c()
+for (v in all_predictors) {
+  if (any(grepl(paste0("^", v), selected))) {
+    refit_vars <- c(refit_vars, v)
+  }
+}
+refit_vars <- unique(refit_vars)
+
+refit_formula <- as.formula(
+  paste("log_PFS ~", paste(refit_vars, collapse = " + "))
+)
+final_model_A <- lm(refit_formula, data = dat_a_model)
+summary(final_model_A)
+```
+
+## Model Diagnostics
+
+```{r diagnostics, fig.width=10, fig.height=8, fig.cap="Diagnostic plots for the final model"}
+par(mfrow = c(2, 2))
+plot(final_model_A)
+```
+
+```{r vif}
+vif(final_model_A)
+```
+
+```{r bp-test}
+bptest(final_model_A)
+```
+
+## Model Performance on Dataset A
+
+```{r performance-A}
+pred_A <- predict(final_model_A, newdata = dat_a_model)
+
+perf_A <- data.frame(
+  Metric = c("R-squared", "Adjusted R-squared", "RMSE", "MAE"),
+  Training = round(c(
+    summary(final_model_A)$r.squared,
+    summary(final_model_A)$adj.r.squared,
+    sqrt(mean((y_a - pred_A)^2)),
+    mean(abs(y_a - pred_A))
+  ), 4),
+  CV = round(c(
+    max(enet_fine$results$Rsquared, na.rm = TRUE),
+    NA,
+    min(enet_fine$results$RMSE, na.rm = TRUE),
+    min(enet_fine$results$MAE, na.rm = TRUE)
+  ), 4)
+)
+
+kable(perf_A, caption = "Table 1: Model Performance on Dataset A") |>
+  kable_styling(full_width = FALSE)
+```
+
+```{r coef-table}
+coef_df <- as.data.frame(summary(final_model_A)$coefficients)
+coef_df$Variable <- rownames(coef_df)
+coef_df <- coef_df |>
+  select(Variable, everything()) |>
+  mutate(CI_lower = Estimate - 1.96 * `Std. Error`,
+         CI_upper = Estimate + 1.96 * `Std. Error`)
+
+kable(coef_df, digits = 4,
+      caption = "Table 2: Final Model Coefficients with 95% CI") |>
+  kable_styling(full_width = FALSE)
+```
+
+---
+
+# Part II — Generalization to Researcher B's Dataset (2000–2005 Cohort)
+
+## Apply Model A to Dataset B
+
+```{r predict-B}
+pred_B <- predict(final_model_A, newdata = dat_b_model)
+
+R2_B <- 1 - sum((y_b - pred_B)^2) / sum((y_b - mean(y_b))^2)
+RMSE_B <- sqrt(mean((y_b - pred_B)^2))
+MAE_B <- mean(abs(y_b - pred_B))
+
+perf_compare <- data.frame(
+  Metric = c("R-squared", "RMSE", "MAE"),
+  DataA_Training = round(c(summary(final_model_A)$r.squared,
+                           sqrt(mean((y_a - pred_A)^2)),
+                           mean(abs(y_a - pred_A))), 4),
+  DataB_External = round(c(R2_B, RMSE_B, MAE_B), 4)
+)
+
+kable(perf_compare,
+      caption = "Table 3: Model A Performance — Dataset A vs Dataset B") |>
+  kable_styling(full_width = FALSE)
+```
+
+```{r pred-vs-actual, fig.width=10, fig.height=5, fig.cap="Predicted vs actual log(PFS): Dataset A (left) and Dataset B (right)"}
+p_a <- ggplot(data.frame(Actual = y_a, Predicted = pred_A),
+              aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Dataset A", x = "Actual log(PFS)", y = "Predicted log(PFS)") +
+  theme_bw()
+
+p_b <- ggplot(data.frame(Actual = y_b, Predicted = pred_B),
+              aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Dataset B", x = "Actual log(PFS)", y = "Predicted log(PFS)") +
+  theme_bw()
+
+ggarrange(p_a, p_b, ncol = 2)
+ggsave("figures/pred_vs_actual.png", width = 12, height = 5, dpi = 300)
+```
+
+```{r residual-B, fig.width=10, fig.height=5, fig.cap="Residual distributions when Model A is applied to both datasets"}
+resid_df <- bind_rows(
+  data.frame(Residual = y_a - pred_A, Dataset = "A"),
+  data.frame(Residual = y_b - pred_B, Dataset = "B")
+)
+
+ggplot(resid_df, aes(x = Residual, fill = Dataset)) +
+  geom_histogram(bins = 40, alpha = 0.6, position = "identity", color = "white") +
+  labs(title = "Residual Distribution: Model A on Dataset A vs B",
+       x = "Residual (Actual - Predicted)", y = "Count") +
+  theme_bw()
+ggsave("figures/residual_comparison.png", width = 10, height = 5, dpi = 300)
+```
+
+```{r bias-check}
+cat("Mean residual on Dataset A:", round(mean(y_a - pred_A), 4), "\n")
+cat("Mean residual on Dataset B:", round(mean(y_b - pred_B), 4), "\n")
+```
+
+## Cohort Comparison
+
+```{r cohort-comparison}
+summary_a <- datA |>
+  select(-id) |>
+  summarise(across(everything(), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(),
+               names_to = c("variable", "stat"),
+               names_pattern = "(.+)_(mean|sd)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(cohort = "A (1990-1995)")
+
+summary_b <- datB |>
+  select(-id) |>
+  summarise(across(everything(), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(),
+               names_to = c("variable", "stat"),
+               names_pattern = "(.+)_(mean|sd)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  mutate(cohort = "B (2000-2005)")
+
+cohort_tbl <- bind_rows(summary_a, summary_b) |>
+  pivot_wider(names_from = cohort,
+              values_from = c(mean, sd),
+              names_glue = "{cohort}_{.value}") |>
+  select(variable, starts_with("A"), starts_with("B"))
+
+kable(cohort_tbl, digits = 3,
+      caption = "Table 4: Covariate Comparison Between Cohorts") |>
+  kable_styling(full_width = FALSE)
+```
+
+## Rebuild Model on Dataset B
+
+```{r enet-B}
+x_mat_B <- model.matrix(log_PFS ~ ., data = dat_b_model)[, -1]
+y_vec_B <- dat_b_model$log_PFS
+
+enet_grid_B <- expand.grid(
+  alpha = seq(0, 1, by = 0.1),
+  lambda = 10^seq(-4, 0, length.out = 50)
+)
+
+enet_fit_B <- train(x_mat_B, y_vec_B,
+                    method = "glmnet",
+                    trControl = ctrl,
+                    tuneGrid = enet_grid_B)
+
+fine_grid_B <- expand.grid(
+  alpha = seq(max(0, enet_fit_B$bestTune$alpha - 0.1),
+              min(1, enet_fit_B$bestTune$alpha + 0.1), by = 0.02),
+  lambda = 10^seq(log10(enet_fit_B$bestTune$lambda) - 1,
+                  log10(enet_fit_B$bestTune$lambda) + 1, length.out = 50)
+)
+
+enet_fine_B <- train(x_mat_B, y_vec_B,
+                     method = "glmnet",
+                     trControl = ctrl,
+                     tuneGrid = fine_grid_B)
+
+best_alpha_B <- enet_fine_B$bestTune$alpha
+best_lambda_B <- enet_fine_B$bestTune$lambda
+cat("Best alpha:", best_alpha_B, "\n")
+cat("Best lambda:", best_lambda_B, "\n")
+cat("CV RMSE:", min(enet_fine_B$results$RMSE, na.rm = TRUE), "\n")
+cat("CV R-squared:", max(enet_fine_B$results$Rsquared, na.rm = TRUE), "\n")
+```
+
+```{r ols-refit-B}
+enet_coefs_B <- coef(enet_fine_B$finalModel, s = best_lambda_B)
+selected_B <- rownames(enet_coefs_B)[which(enet_coefs_B != 0)][-1]
+
+refit_vars_B <- c()
+for (v in all_predictors) {
+  if (any(grepl(paste0("^", v), selected_B))) {
+    refit_vars_B <- c(refit_vars_B, v)
+  }
+}
+refit_vars_B <- unique(refit_vars_B)
+
+refit_formula_B <- as.formula(
+  paste("log_PFS ~", paste(refit_vars_B, collapse = " + "))
+)
+final_model_B <- lm(refit_formula_B, data = dat_b_model)
+summary(final_model_B)
+```
+
+## Coefficient Comparison
+
+```{r coef-compare, fig.width=8, fig.height=6, fig.cap="Coefficient comparison between Model A and Model B"}
+coef_A <- as.data.frame(summary(final_model_A)$coefficients) |>
+  mutate(Variable = rownames(summary(final_model_A)$coefficients),
+         Model = "A (1990-1995)")
+
+coef_B <- as.data.frame(summary(final_model_B)$coefficients) |>
+  mutate(Variable = rownames(summary(final_model_B)$coefficients),
+         Model = "B (2000-2005)")
+
+coef_both <- bind_rows(coef_A, coef_B) |>
+  filter(Variable != "(Intercept)")
+
+ggplot(coef_both, aes(x = reorder(Variable, Estimate), y = Estimate,
+                      color = Model)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = Estimate - 1.96 * `Std. Error`,
+                    ymax = Estimate + 1.96 * `Std. Error`),
+                position = position_dodge(width = 0.5), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  coord_flip() +
+  labs(title = "Coefficient Comparison: Model A vs Model B",
+       x = NULL, y = "Estimate (95% CI)") +
+  theme_bw()
+ggsave("figures/coef_comparison.png", width = 8, height = 6, dpi = 300)
+```
+
+```{r coef-table-compare}
+coef_wide <- coef_both |>
+  select(Variable, Model, Estimate, `Pr(>|t|)`) |>
+  pivot_wider(names_from = Model,
+              values_from = c(Estimate, `Pr(>|t|)`),
+              names_glue = "{Model}_{.value}")
+
+kable(coef_wide, digits = 4,
+      caption = "Table 5: Side-by-Side Coefficient Comparison") |>
+  kable_styling(full_width = FALSE)
+```
+
+## Final Performance Summary
+
+```{r final-summary}
+pred_B_new <- predict(final_model_B, newdata = dat_b_model)
+
+final_perf <- data.frame(
+  Scenario = c("Model A on Data A",
+               "Model A on Data B",
+               "Model B on Data B"),
+  R_squared = round(c(
+    summary(final_model_A)$r.squared,
+    R2_B,
+    summary(final_model_B)$r.squared
+  ), 4),
+  RMSE = round(c(
+    sqrt(mean((y_a - pred_A)^2)),
+    RMSE_B,
+    sqrt(mean((y_b - pred_B_new)^2))
+  ), 4),
+  MAE = round(c(
+    mean(abs(y_a - pred_A)),
+    MAE_B,
+    mean(abs(y_b - pred_B_new))
+  ), 4)
+)
+
+kable(final_perf,
+      caption = "Table 6: Final Performance Summary Across All Scenarios") |>
+  kable_styling(full_width = FALSE)
 ```

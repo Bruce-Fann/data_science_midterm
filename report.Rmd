@@ -1,0 +1,413 @@
+---
+title: "P8106 Data Science II -- Midterm Project Report"
+author: "Group 33: Zichen Fan, Yiming Cao"
+date: "2026-03-29"
+output:
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{fontspec}
+  - \setmainfont{Times New Roman}
+  - \usepackage{setspace}
+  - \onehalfspacing
+  - \usepackage[margin=1in]{geometry}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \floatplacement{table}{H}
+  - \floatplacement{figure}{H}
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "90%")
+set.seed(2026)
+
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(car)
+library(lmtest)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+library(corrplot)
+
+load("data/datA.RData")
+load("data/datB.RData")
+
+recode_factors <- function(df) {
+  df |> mutate(
+    menopause = factor(menopause, 0:1, c("Pre", "Post")),
+    race = factor(race, 1:4, c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade = factor(tumor_grade, 1:3, c("Well", "Moderate", "Poor")),
+    ER = factor(ER, 0:1, c("Neg", "Pos")),
+    PR = factor(PR, 0:1, c("Neg", "Pos")),
+    HER2 = factor(HER2, 0:1, c("Neg", "Pos")),
+    stage = factor(stage, 1:3, c("I", "II", "III")),
+    surgery = factor(surgery, 0:1, c("BCS", "Mastectomy")),
+    chemo = factor(chemo, 0:1, c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, 0:1, c("No", "Yes"))
+  )
+}
+
+dat_a <- recode_factors(datA)
+dat_b <- recode_factors(datB)
+dat_a_model <- dat_a |> select(-id)
+dat_b_model <- dat_b |> select(-id)
+y_a <- dat_a$log_PFS
+y_b <- dat_b$log_PFS
+
+# Model A
+x_mat <- model.matrix(log_PFS ~ ., data = dat_a_model)[, -1]
+ctrl <- trainControl(method = "cv", number = 10)
+enet_fit <- train(x_mat, y_a, method = "glmnet", trControl = ctrl,
+  tuneGrid = expand.grid(alpha = seq(0, 1, 0.1),
+                         lambda = 10^seq(-4, 0, length.out = 50)))
+fine_grid <- expand.grid(
+  alpha = seq(max(0, enet_fit$bestTune$alpha - 0.1),
+              min(1, enet_fit$bestTune$alpha + 0.1), 0.02),
+  lambda = 10^seq(log10(enet_fit$bestTune$lambda) - 1,
+                  log10(enet_fit$bestTune$lambda) + 1, length.out = 50))
+enet_fine <- train(x_mat, y_a, method = "glmnet", trControl = ctrl,
+                   tuneGrid = fine_grid)
+enet_coefs <- coef(enet_fine$finalModel, s = enet_fine$bestTune$lambda)
+selected <- rownames(enet_coefs)[which(enet_coefs != 0)][-1]
+all_predictors <- names(dat_a_model)[names(dat_a_model) != "log_PFS"]
+rv <- c()
+for (v in all_predictors) if (any(grepl(paste0("^", v), selected))) rv <- c(rv, v)
+rv <- unique(rv)
+final_model_A <- lm(as.formula(paste("log_PFS ~", paste(rv, collapse = " + "))),
+                     dat_a_model)
+pred_A <- predict(final_model_A, dat_a_model)
+pred_B <- predict(final_model_A, dat_b_model)
+R2_B <- 1 - sum((y_b - pred_B)^2) / sum((y_b - mean(y_b))^2)
+
+# Model B
+x_B <- model.matrix(log_PFS ~ ., data = dat_b_model)[, -1]
+enet_B <- train(x_B, y_b, method = "glmnet", trControl = ctrl,
+  tuneGrid = expand.grid(alpha = seq(0, 1, 0.1),
+                         lambda = 10^seq(-4, 0, length.out = 50)))
+fine_B <- expand.grid(
+  alpha = seq(max(0, enet_B$bestTune$alpha - 0.1),
+              min(1, enet_B$bestTune$alpha + 0.1), 0.02),
+  lambda = 10^seq(log10(enet_B$bestTune$lambda) - 1,
+                  log10(enet_B$bestTune$lambda) + 1, length.out = 50))
+enet_fine_B <- train(x_B, y_b, method = "glmnet", trControl = ctrl,
+                     tuneGrid = fine_B)
+ec_B <- coef(enet_fine_B$finalModel, s = enet_fine_B$bestTune$lambda)
+sel_B <- rownames(ec_B)[which(ec_B != 0)][-1]
+rv_B <- c()
+for (v in all_predictors) if (any(grepl(paste0("^", v), sel_B))) rv_B <- c(rv_B, v)
+rv_B <- unique(rv_B)
+final_model_B <- lm(as.formula(paste("log_PFS ~", paste(rv_B, collapse = " + "))),
+                     dat_b_model)
+pred_B_new <- predict(final_model_B, dat_b_model)
+
+# 10-fold CV for the OLS refit models (consistent with reported model)
+refit_formula_A <- as.formula(paste("log_PFS ~", paste(rv, collapse = " + ")))
+cv_ols_A <- train(refit_formula_A, data = dat_a_model, method = "lm", trControl = ctrl)
+
+refit_formula_B <- as.formula(paste("log_PFS ~", paste(rv_B, collapse = " + ")))
+cv_ols_B <- train(refit_formula_B, data = dat_b_model, method = "lm", trControl = ctrl)
+```
+
+# 1. Introduction
+
+Progression-free survival (PFS) is a central endpoint in breast cancer research, measuring the time from diagnosis to disease progression or death. Researcher A collected data on 2000 breast cancer patients diagnosed between 1990 and 1995, recording demographic characteristics, tumor features, and initial treatments. All patients had complete follow-up, and the primary outcome is log-transformed PFS in months. Our goal is twofold: first, build a prediction model that identifies which patient and tumor features drive PFS; second, evaluate whether this model generalizes to a later cohort of 2000 patients diagnosed between 2000 and 2005.
+
+# 2. Methods
+
+## 2.1 Data Description
+
+Both datasets contain 2000 observations and 15 predictors with no missing values. The predictors include five continuous variables (age, BMI, tumor size, number of positive lymph nodes, Ki-67 index) and ten categorical variables (menopausal status, race, tumor grade, ER/PR/HER2 status, clinical stage, surgery type, chemotherapy, and hormonal therapy). All categorical variables were encoded as factors with descriptive labels.
+
+## 2.2 Exploratory Data Analysis
+
+The distribution of log(PFS) is approximately normal, supporting the use of linear regression (see Figure 1). Bivariate relationships were assessed through correlation analysis, scatterplots with loess smoothers, and boxplots (see Figures 2--4). Two key findings guided model selection. First, substantial multicollinearity exists among predictors: ER and PR are highly correlated (r = 0.74), ER and hormonal therapy are correlated (r = 0.65), and clinical stage overlaps with tumor size and lymph node count. Second, several predictors---BMI, menopausal status, and race---show negligible association with log(PFS).
+
+## 2.3 Model Training
+
+Given the multicollinearity and uninformative predictors identified in EDA, we chose elastic net regression, which combines the L1 penalty for variable selection and the L2 penalty for handling correlated predictors. Elastic net has two hyperparameters: the mixing parameter $\alpha$ ($\alpha = 0$ is ridge, $\alpha = 1$ is lasso) and the regularization strength $\lambda$.
+
+We tuned both parameters using 10-fold cross-validation via the `caret` package. An initial coarse grid searched $\alpha \in \{0, 0.1, \ldots, 1\}$ and 50 values of $\lambda$ on a log scale from $10^{-4}$ to $10^{0}$. A second fine-tuning round narrowed the search around the initial optimum with $\alpha$ in steps of 0.02. The combination minimizing cross-validated RMSE was selected. The optimal parameters for Dataset A were $\alpha$ = `r enet_fine$bestTune$alpha` and $\lambda$ = `r round(enet_fine$bestTune$lambda, 4)`, indicating a model close to lasso with a small ridge component. To obtain standard errors and p-values, we refit an ordinary least squares model using only the variables with nonzero elastic net coefficients. We note that this post-selection inference approach can produce optimistic p-values, since the variable selection step is not accounted for in the OLS standard errors; the reported p-values should therefore be interpreted as exploratory rather than confirmatory. To evaluate predictive performance, we ran a separate 10-fold cross-validation on the refitted OLS model. Model diagnostics were assessed through residual plots (see Figure 5), variance inflation factors, and the Breusch-Pagan test for heteroscedasticity.
+
+## 2.4 Generalization Assessment
+
+To evaluate generalization, we applied Model A directly to Dataset B and compared R-squared, RMSE, and MAE. We then rebuilt an elastic net model on Dataset B using the same tuning procedure and compared the resulting coefficients and selected variables.
+
+# 3. Results
+
+## 3.1 Prediction Model on Dataset A
+
+Elastic net selected 9 of 15 predictors, dropping menopausal status, BMI, PR, clinical stage, surgery type, and chemotherapy. PR was dropped due to its high correlation with ER, and clinical stage was dropped because its information is already captured by tumor size and lymph node count. The full coefficient table is shown in Table 1.
+
+The refitted OLS model yields an adjusted R-squared of `r round(summary(final_model_A)$adj.r.squared, 3)` and a training RMSE of `r round(sqrt(mean((y_a - pred_A)^2)), 3)` (see Table 2). The 10-fold cross-validated RMSE of `r round(cv_ols_A$results$RMSE, 3)` is close to the training RMSE, suggesting minimal overfitting. Diagnostics reveal no serious violations: residuals show no systematic patterns (see Figure 5), all VIF values are below 2.2, and the Breusch-Pagan test is non-significant (p = 0.80).
+
+The strongest predictors of longer PFS are ER-positive status (coefficient = 0.235, p < 0.001) and hormonal therapy (0.134, p < 0.001). The strongest predictors of shorter PFS are number of positive lymph nodes (--0.061 per node, p < 0.001), HER2-positive status (--0.172, p < 0.001), poorly differentiated grade (--0.165, p = 0.005), and larger tumor size (--0.051 per cm, p < 0.001). Since the outcome is log-transformed, each coefficient can be interpreted on a multiplicative scale: for instance, each additional positive lymph node is associated with approximately a 6\% decrease in PFS ($e^{-0.061} \approx 0.94$).
+
+The R-squared of 0.20 indicates the model explains about 20\% of the variance in log(PFS). While modest, this is expected for clinical data where unmeasured factors---genomic features, treatment adherence, comorbidities---also influence outcomes.
+
+## 3.2 Generalization to Dataset B
+
+Applying Model A to Dataset B yields an R-squared of `r round(R2_B, 3)`, RMSE of `r round(sqrt(mean((y_b - pred_B)^2)), 3)`, and a mean residual of `r round(mean(y_b - pred_B), 3)` (see Table 3). The negative R-squared means the model performs worse than predicting the sample mean of Dataset B. The positive mean residual indicates systematic under-prediction: the 1990s model cannot account for the improved survival seen in the 2000s cohort. The predicted-versus-actual plots in Figure 6 and residual distributions in Figure 7 confirm this shift.
+
+Comparing the two cohorts (see Table 4), Dataset B patients have higher mean log(PFS) (2.74 vs 2.20), receive more chemotherapy (65\% vs 55\%) and hormonal therapy (57\% vs 47\%), and have slightly smaller tumors. These differences reflect the evolution of breast cancer treatment across the decade.
+
+We rebuilt a model on Dataset B using the same elastic net procedure. The optimal parameters shifted to $\alpha$ = `r enet_fine_B$bestTune$alpha` (pure ridge), retaining all 15 predictors. This suggests the predictor-outcome relationships in the later cohort are more diffuse. The refitted model on Dataset B achieves a training R-squared of `r round(summary(final_model_B)$r.squared, 3)` and a 10-fold cross-validated RMSE of `r round(cv_ols_B$results$RMSE, 3)` (see Table 5), comparable to Model A's performance on its own data.
+
+Several coefficient changes stand out (see Figure 8 and Table 6). The intercept increased from 2.67 to 3.19, reflecting improved baseline PFS. The lymph node effect weakened (--0.061 to --0.031), possibly due to improved systemic therapies. ER remained significant but with a smaller coefficient (0.235 to 0.135). HER2-positive status, strongly negative in Model A (--0.172, p < 0.001), became non-significant in Model B (0.042, p = 0.25), likely reflecting the introduction of trastuzumab-based targeted therapy around 2000. Hormonal therapy showed a stronger effect (0.210 vs 0.134), consistent with the development of more effective hormonal agents.
+
+# 4. Discussion
+
+The prediction model does not generalize from the 1990--1995 cohort to the 2000--2005 cohort. Three types of distributional shift contribute: outcome shift (PFS improved overall, making predictions systematically too low), covariate shift (treatment patterns changed with greater use of chemotherapy and hormonal therapy), and concept drift (the relationships between predictors and outcomes changed, most notably for HER2 status). These findings highlight that clinical prediction models require periodic recalibration as treatment paradigms evolve. Future work could explore time-adaptive modeling or the incorporation of genomic biomarkers for more stable predictions.
+
+\newpage
+
+# Appendix
+
+```{r fig1, fig.cap="Distribution and Q-Q plot of log(PFS) in Dataset A.", fig.width=8, fig.height=3.5}
+p1 <- ggplot(dat_a, aes(x = log_PFS)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white", alpha = 0.85) +
+  labs(x = "log(PFS)", y = "Count") + theme_bw()
+p2 <- ggplot(dat_a, aes(sample = log_PFS)) +
+  stat_qq(color = "steelblue", alpha = 0.5) +
+  stat_qq_line(color = "firebrick") +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") + theme_bw()
+ggarrange(p1, p2, ncol = 2)
+```
+
+```{r fig2, fig.cap="Correlation matrix of all variables (using raw numeric coding).", fig.width=6, fig.height=6, out.width="75%"}
+numeric_for_cor <- datA |> select(-id)
+cor_mat <- cor(numeric_for_cor)
+par(mar = c(1, 1, 1, 1))
+corrplot(cor_mat, method = "color", type = "lower",
+         tl.cex = 0.65, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.45, diag = FALSE)
+```
+
+```{r fig3, fig.cap="Continuous predictors versus log(PFS) with loess smoother.", fig.width=8, fig.height=5}
+dat_a |>
+  select(age, bmi, tumor_size, lymph_nodes, Ki67, log_PFS) |>
+  pivot_longer(-log_PFS) |>
+  ggplot(aes(x = value, y = log_PFS)) +
+  geom_point(alpha = 0.2, size = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "firebrick", linewidth = 0.7) +
+  facet_wrap(~ name, scales = "free_x", ncol = 3) +
+  labs(x = "Predictor value", y = "log(PFS)") + theme_bw(base_size = 9)
+```
+
+```{r fig4, fig.cap="log(PFS) distribution by categorical predictors.", fig.width=8, fig.height=6}
+dat_a |>
+  select(menopause, race, tumor_grade, ER, PR, HER2, stage,
+         surgery, chemo, hormonal_therapy, log_PFS) |>
+  pivot_longer(-log_PFS) |>
+  ggplot(aes(x = value, y = log_PFS, fill = value)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.3) +
+  facet_wrap(~ name, scales = "free_x", ncol = 4) +
+  labs(x = NULL, y = "log(PFS)") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 6))
+```
+
+```{r fig5, fig.cap="Diagnostic plots for Model A.", fig.width=8, fig.height=7, out.width="85%"}
+par(mfrow = c(2, 2))
+plot(final_model_A)
+```
+
+```{r fig6, fig.cap="Predicted versus actual log(PFS) for Dataset A (left) and Dataset B (right).", fig.width=8, fig.height=3.5}
+p_a <- ggplot(data.frame(Actual = y_a, Predicted = pred_A),
+              aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.2, size = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Dataset A", x = "Actual", y = "Predicted") + theme_bw(base_size = 9)
+p_b <- ggplot(data.frame(Actual = y_b, Predicted = pred_B),
+              aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.2, size = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Dataset B", x = "Actual", y = "Predicted") + theme_bw(base_size = 9)
+ggarrange(p_a, p_b, ncol = 2)
+```
+
+```{r fig7, fig.cap="Residual distributions when Model A is applied to Dataset A and Dataset B.", fig.width=7, fig.height=3.5}
+bind_rows(
+  data.frame(Residual = y_a - pred_A, Dataset = "A"),
+  data.frame(Residual = y_b - pred_B, Dataset = "B")
+) |>
+  ggplot(aes(x = Residual, fill = Dataset)) +
+  geom_histogram(bins = 40, alpha = 0.6, position = "identity", color = "white") +
+  labs(x = "Residual (Actual - Predicted)", y = "Count") + theme_bw(base_size = 9)
+```
+
+```{r fig8, fig.cap="Coefficient comparison between Model A (1990--1995) and Model B (2000--2005) with 95\\% CI.", fig.width=7, fig.height=5}
+coef_A_plot <- as.data.frame(summary(final_model_A)$coefficients) |>
+  mutate(Variable = gsub("[()]", "", rownames(summary(final_model_A)$coefficients)),
+         Model = "A")
+coef_B_plot <- as.data.frame(summary(final_model_B)$coefficients) |>
+  mutate(Variable = gsub("[()]", "", rownames(summary(final_model_B)$coefficients)),
+         Model = "B")
+bind_rows(coef_A_plot, coef_B_plot) |>
+  filter(Variable != "Intercept") |>
+  ggplot(aes(x = reorder(Variable, Estimate), y = Estimate, color = Model)) +
+  geom_point(position = position_dodge(0.5), size = 2) +
+  geom_errorbar(aes(ymin = Estimate - 1.96 * `Std. Error`,
+                    ymax = Estimate + 1.96 * `Std. Error`),
+                position = position_dodge(0.5), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  coord_flip() +
+  labs(x = NULL, y = "Estimate (95% CI)") +
+  theme_bw(base_size = 9)
+```
+
+\begingroup
+\small
+
+```{r tab1}
+coef_raw <- summary(final_model_A)$coefficients
+coef_df <- data.frame(
+  Variable = gsub("[()]", "", rownames(coef_raw)),
+  Estimate = round(coef_raw[, 1], 4),
+  SE = round(coef_raw[, 2], 4),
+  p = round(coef_raw[, 4], 4),
+  row.names = NULL
+)
+kable(coef_df, booktabs = TRUE,
+      caption = "Model A coefficient estimates, standard errors, and p-values.",
+      col.names = c("Variable", "Estimate", "Std. Error", "p-value"))
+```
+
+```{r tab2}
+perf_A <- data.frame(
+  Metric = c("R-squared", "Adj. R-squared", "RMSE", "MAE"),
+  Training = round(c(summary(final_model_A)$r.squared,
+                     summary(final_model_A)$adj.r.squared,
+                     sqrt(mean((y_a - pred_A)^2)),
+                     mean(abs(y_a - pred_A))), 4),
+  CV = c(round(cv_ols_A$results$Rsquared, 4),
+         "--",
+         round(cv_ols_A$results$RMSE, 4),
+         round(cv_ols_A$results$MAE, 4))
+)
+kable(perf_A, booktabs = TRUE,
+      caption = "Model A (OLS refit) performance on Dataset A: training and 10-fold CV.")
+```
+
+```{r tab3}
+perf_compare <- data.frame(
+  Metric = c("R-squared", "RMSE", "MAE", "Mean Residual"),
+  Dataset.A = c(round(summary(final_model_A)$r.squared, 4),
+                round(sqrt(mean((y_a - pred_A)^2)), 4),
+                round(mean(abs(y_a - pred_A)), 4),
+                round(mean(y_a - pred_A), 4)),
+  Dataset.B = c(round(R2_B, 4),
+                round(sqrt(mean((y_b - pred_B)^2)), 4),
+                round(mean(abs(y_b - pred_B)), 4),
+                round(mean(y_b - pred_B), 4))
+)
+kable(perf_compare, booktabs = TRUE,
+      caption = "Model A applied to Dataset A versus Dataset B.",
+      col.names = c("Metric", "Dataset A", "Dataset B"))
+```
+
+```{r tab4}
+cont_vars <- c("age", "bmi", "tumor_size", "lymph_nodes", "Ki67", "log_PFS")
+cat_vars <- list(
+  menopause = c("0" = "Pre", "1" = "Post"),
+  ER = c("0" = "Neg", "1" = "Pos"),
+  PR = c("0" = "Neg", "1" = "Pos"),
+  HER2 = c("0" = "Neg", "1" = "Pos"),
+  surgery = c("0" = "BCS", "1" = "Mastectomy"),
+  chemo = c("0" = "No", "1" = "Yes"),
+  hormonal_therapy = c("0" = "No", "1" = "Yes")
+)
+multi_vars <- list(
+  race = c("1" = "White", "2" = "Black", "3" = "Asian", "4" = "Hispanic"),
+  tumor_grade = c("1" = "Well", "2" = "Moderate", "3" = "Poor"),
+  stage = c("1" = "I", "2" = "II", "3" = "III")
+)
+
+rows <- list()
+for (v in cont_vars) {
+  rows[[length(rows) + 1]] <- data.frame(
+    Variable = v,
+    `Cohort A` = paste0(round(mean(datA[[v]]), 2), " (", round(sd(datA[[v]]), 2), ")"),
+    `Cohort B` = paste0(round(mean(datB[[v]]), 2), " (", round(sd(datB[[v]]), 2), ")"),
+    check.names = FALSE
+  )
+}
+for (v in names(cat_vars)) {
+  lvls <- cat_vars[[v]]
+  pA <- round(mean(datA[[v]] == 1) * 100, 1)
+  pB <- round(mean(datB[[v]] == 1) * 100, 1)
+  rows[[length(rows) + 1]] <- data.frame(
+    Variable = paste0(v, " (", lvls[["1"]], ")"),
+    `Cohort A` = paste0(pA, "%"),
+    `Cohort B` = paste0(pB, "%"),
+    check.names = FALSE
+  )
+}
+for (v in names(multi_vars)) {
+  lvls <- multi_vars[[v]]
+  for (k in names(lvls)) {
+    pA <- round(mean(datA[[v]] == as.numeric(k)) * 100, 1)
+    pB <- round(mean(datB[[v]] == as.numeric(k)) * 100, 1)
+    rows[[length(rows) + 1]] <- data.frame(
+      Variable = paste0("  ", v, ": ", lvls[[k]]),
+      `Cohort A` = paste0(pA, "%"),
+      `Cohort B` = paste0(pB, "%"),
+      check.names = FALSE
+    )
+  }
+}
+tab4_df <- bind_rows(rows)
+kable(tab4_df, booktabs = TRUE,
+      caption = "Covariate comparison between cohorts. Continuous variables: mean (SD); categorical: percentage.",
+      col.names = c("Variable", "Cohort A", "Cohort B"))
+```
+
+```{r tab5}
+final_perf <- data.frame(
+  Scenario = c("Model A on Data A", "Model A on Data A (CV)",
+               "Model A on Data B",
+               "Model B on Data B", "Model B on Data B (CV)"),
+  R2 = c(round(summary(final_model_A)$r.squared, 4),
+         round(cv_ols_A$results$Rsquared, 4),
+         round(R2_B, 4),
+         round(summary(final_model_B)$r.squared, 4),
+         round(cv_ols_B$results$Rsquared, 4)),
+  RMSE = c(round(sqrt(mean((y_a - pred_A)^2)), 4),
+           round(cv_ols_A$results$RMSE, 4),
+           round(sqrt(mean((y_b - pred_B)^2)), 4),
+           round(sqrt(mean((y_b - pred_B_new)^2)), 4),
+           round(cv_ols_B$results$RMSE, 4)),
+  MAE = c(round(mean(abs(y_a - pred_A)), 4),
+          round(cv_ols_A$results$MAE, 4),
+          round(mean(abs(y_b - pred_B)), 4),
+          round(mean(abs(y_b - pred_B_new)), 4),
+          round(cv_ols_B$results$MAE, 4))
+)
+kable(final_perf, booktabs = TRUE,
+      caption = "Performance summary across all scenarios.",
+      col.names = c("Scenario", "R-squared", "RMSE", "MAE"))
+```
+
+```{r tab6}
+coef_A_tbl <- data.frame(
+  Variable = gsub("[()]", "", names(coef(final_model_A))),
+  A = round(coef(final_model_A), 3),
+  row.names = NULL
+)
+coef_B_tbl <- data.frame(
+  Variable = gsub("[()]", "", names(coef(final_model_B))),
+  B = round(coef(final_model_B), 3),
+  row.names = NULL
+)
+full_join(coef_A_tbl, coef_B_tbl, by = "Variable") |>
+  kable(booktabs = TRUE,
+        caption = "Side-by-side coefficient estimates for Model A and Model B.",
+        col.names = c("Variable", "Model A", "Model B"))
+```
+
+\endgroup
